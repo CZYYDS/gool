@@ -36,13 +36,12 @@ func (w *Worker) Close() {
 }
 func (w *Worker) Expire(maxLifeTime, maxIdleTime time.Duration) bool {
 	if maxLifeTime > 0 {
-		return nowFunc.Before((w.createdAt).Add(maxLifeTime * time.Second))
+		return nowFunc.After((w.createdAt).Add(maxLifeTime))
 	}
 	if maxIdleTime > 0 {
 		if w.returnAt != nil {
-			return nowFunc.Before((*w.returnAt).Add(maxIdleTime * time.Second))
+			return nowFunc.After((*w.returnAt).Add(maxIdleTime))
 		}
-		return false
 	}
 	return false
 }
@@ -83,7 +82,9 @@ func (w *Worker) Run() {
 		}
 		//走到这说明worker是空闲的
 		w.pool.mutex.Lock()
+		w.returnAt = &nowFunc
 		w.pool.IdleWorkers = append(w.pool.IdleWorkers, w)
+		atomic.AddInt64(&w.pool.IdleWorkersNum, 1)
 		w.pool.mutex.Unlock()
 		return
 	}

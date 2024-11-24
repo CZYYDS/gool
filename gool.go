@@ -9,16 +9,18 @@ import (
 
 const (
 	defaultIdleTimeout = 10 * time.Second
-	defaultmaxCapacity = 10
-	defaultmaxWorkers  = 8
+	defaultMaxCapacity = 10
+	defaultMaxWorkers  = 8
 )
 
 type ThreadPool struct {
 	mutex        sync.Mutex    //锁
 	RequestTasks chan func()   //任务队列
-	oppenerChan  chan struct{} //Work线程创建信号
+	openerChan   chan struct{} //Work线程创建信号
 	cleanerChan  *struct{}     //Work线程清除信号
-	IdleWorkers  []*Worker     //空闲Work列表
+	IdleWorkers  []*Worker     //空闲Worker列表
+
+	IdleWorkersNum int64 //空闲Worker数量
 
 	MaxWorkers  int64 //最大工作线程数
 	OpenWorkers int64 //当前工作线程数
@@ -39,28 +41,15 @@ type ThreadPool struct {
 	cancel context.CancelFunc
 }
 
-type Option func(*ThreadPool)
-
-func WithMinWorkers(min int64) Option {
-	return func(pool *ThreadPool) {
-		if min >= pool.MaxWorkers {
-			pool.minWorkers = 0
-			return
-		}
-		pool.minWorkers = min
-	}
+func (pool *ThreadPool) getOpenWorkers() int64 {
+	return atomic.LoadInt64(&pool.OpenWorkers)
 }
-func WithMaxLifeTime(maxLifeTime time.Duration) Option {
-	return func(pool *ThreadPool) {
-		pool.MaxLifeTime = maxLifeTime
-	}
+func (pool *ThreadPool) getWaitTaskNum() int64 {
+	return atomic.LoadInt64(&pool.WaitTaskNum)
 }
-func WithIdleTimeout(idleTimeout time.Duration) Option {
-	return func(pool *ThreadPool) {
-		pool.MaxIdleTime = idleTimeout
-	}
+func (pool *ThreadPool) getIdleWorkersNum() int64 {
+	return atomic.LoadInt64(&pool.IdleWorkersNum)
 }
-
 func New(maxCapacity, maxWorkers int64, options ...Option) *ThreadPool {
 
 	// Instantiate the pool
@@ -68,15 +57,15 @@ func New(maxCapacity, maxWorkers int64, options ...Option) *ThreadPool {
 
 	//确保参数正确
 	if maxCapacity <= 0 {
-		maxCapacity = defaultmaxCapacity
+		maxCapacity = defaultMaxCapacity
 	}
 	if maxWorkers <= 0 {
-		maxWorkers = defaultmaxWorkers
+		maxWorkers = defaultMaxWorkers
 	}
 
 	pool := &ThreadPool{
 		RequestTasks:    make(chan func(), maxCapacity),
-		oppenerChan:     make(chan struct{}, maxWorkers),
+		openerChan:      make(chan struct{}, maxWorkers),
 		MaxWorkers:      maxWorkers,
 		MaxIdleTime:     defaultIdleTimeout,
 		MaxLifeTime:     0, //当最大存活时间未设置时，默认不回收
@@ -111,6 +100,7 @@ func (pool *ThreadPool) initWorks() {
 		for i := int64(0); i < pool.minWorkers; i++ {
 			worker := NewWorker(pool.ctx, pool)
 			pool.IdleWorkers = append(pool.IdleWorkers, worker)
+			atomic.AddInt64(&pool.IdleWorkersNum, 1)
 		}
 		atomic.AddInt64(&pool.OpenWorkers, pool.minWorkers)
 	}
@@ -122,7 +112,7 @@ func (pool *ThreadPool) WorkerOpener() {
 		select {
 		case <-pool.ctx.Done():
 			return
-		case <-pool.oppenerChan:
+		case <-pool.openerChan:
 			pool.openNewWorker(pool.ctx)
 		}
 	}
@@ -139,11 +129,8 @@ func (pool *ThreadPool) openNewWorker(ctx context.Context) {
 		return
 	default:
 	}
-	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
-
 	//判断是否需要创建新的Work线程
-	if pool.OpenWorkers >= pool.MaxWorkers {
+	if pool.getOpenWorkers() >= pool.MaxWorkers {
 		return
 	}
 	//TODO 创建一个新的Work
@@ -166,7 +153,7 @@ func (pool *ThreadPool) putWorkerThread(ctx context.Context, worker *Worker) boo
 	default:
 	}
 	//存在请求任务
-	if pool.WaitTaskNum > 0 {
+	if pool.getWaitTaskNum() > 0 {
 		//随机获取一个任务请求
 		select {
 		case <-ctx.Done():
@@ -175,14 +162,18 @@ func (pool *ThreadPool) putWorkerThread(ctx context.Context, worker *Worker) boo
 			go worker.Run()
 			return true
 		}
-	} else if pool.MaxWorkers > 0 && pool.MaxWorkers > pool.OpenWorkers {
+	} else if pool.MaxWorkers > 0 && pool.MaxWorkers > pool.getIdleWorkersNum() {
+
 		worker.returnAt = &nowFunc
+		pool.mutex.Lock()
 		pool.IdleWorkers = append(pool.IdleWorkers, worker)
+		atomic.AddInt64(&pool.IdleWorkersNum, 1)
 		//当空闲协程数量大于1时，开启一个Clean线程
-		if len(pool.IdleWorkers) > 1 && pool.cleanerChan == nil {
+		if pool.getIdleWorkersNum() > 1 && pool.cleanerChan == nil {
 			pool.cleanerChan = &struct{}{}
 			go pool.CleanWorkers()
 		}
+		pool.mutex.Unlock()
 		return true
 	}
 	return false
@@ -197,10 +188,11 @@ func (pool *ThreadPool) mayOpenWorkerThread() bool {
 		return true
 	default:
 	}
-	canOpenWorkers := pool.MaxWorkers - pool.OpenWorkers
+	canOpenWorkers := pool.MaxWorkers - pool.getOpenWorkers()
 	for canOpenWorkers > 0 {
 		canOpenWorkers--
-		pool.oppenerChan <- struct{}{}
+		pool.openerChan <- struct{}{}
+		//TODO 这里应该让开启的Worker数量++
 	}
 	return true
 
@@ -225,29 +217,24 @@ func (pool *ThreadPool) Submit(task func()) bool {
 	if task == nil {
 		panic("Task is nil")
 	}
-
 	select {
 	case <-pool.ctx.Done():
 		return false
 	default:
 	}
-	pool.mutex.Lock()
 
 	//1.判断是否有空闲的Work线程
-	idleWorkersNum := len(pool.IdleWorkers)
-	if idleWorkersNum > 0 {
+	if pool.getIdleWorkersNum() > 0 {
 		//TODO 可以开启一个Clean线程,清理空闲的Work
+		pool.mutex.Lock()
 		worker := pool.IdleWorkers[0]
 		pool.IdleWorkers = pool.IdleWorkers[1:]
-		// 开启一个协程执行任务
-		go worker.Run()
-
+		atomic.AddInt64(&pool.IdleWorkersNum, -1)
 		pool.mutex.Unlock()
-		return true
+		go worker.Run()
 	}
-	pool.mutex.Unlock()
 	//2.判断是否需要创建新的Work线程，可以优化一下
-	if pool.OpenWorkers < pool.MaxWorkers {
+	if pool.getOpenWorkers() < pool.MaxWorkers {
 		pool.mayOpenWorkerThread()
 	}
 	// pool.mutex.Unlock()
@@ -257,7 +244,7 @@ func (pool *ThreadPool) Submit(task func()) bool {
 	return true
 
 }
-func (pool *ThreadPool) Trysubmit(task func(), timeout time.Duration) {
+func (pool *ThreadPool) TrySubmit(task func(), timeout time.Duration) {
 	if pool.stopped {
 		return
 	}
@@ -291,15 +278,15 @@ func (pool *ThreadPool) CleanWorkers() {
 		default:
 		}
 		pool.mutex.Lock()
-		idleWorkerNum := len(pool.IdleWorkers)
-		if idleWorkerNum > 0 {
-			for i := 0; i < idleWorkerNum; i++ {
+		if pool.getIdleWorkersNum() > 0 {
+			for i := 0; i < int(pool.getIdleWorkersNum()); i++ {
 				worker := pool.IdleWorkers[i]
 				//如果worker没有任务且超过最大空闲时间,则关闭该worker
 				if worker.Expire(pool.MaxLifeTime, pool.MaxIdleTime) {
 					worker.Close()
 					pool.IdleWorkers = append(pool.IdleWorkers[:i], pool.IdleWorkers[i+1:]...)
 					atomic.AddInt64(&pool.OpenWorkers, -1)
+					atomic.AddInt64(&pool.IdleWorkersNum, -1)
 					pool.mayOpenWorkerThread()
 				}
 			}
