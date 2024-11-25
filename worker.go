@@ -11,7 +11,6 @@ var nowFunc = time.Now()
 
 type Worker struct {
 	pool      *ThreadPool //所属线程池
-	close     bool        //是否关闭
 	ctx       context.Context
 	createdAt time.Time
 	returnAt  *time.Time
@@ -25,13 +24,6 @@ func NewWorker(ctx context.Context, pool *ThreadPool) *Worker {
 		mutex:     sync.Mutex{},
 		returnAt:  nil,
 		pool:      pool,
-	}
-}
-func (w *Worker) Close() {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
-	if !w.close {
-		w.close = true
 	}
 }
 func (w *Worker) Expire(maxLifeTime, maxIdleTime time.Duration) bool {
@@ -48,9 +40,8 @@ func (w *Worker) Expire(maxLifeTime, maxIdleTime time.Duration) bool {
 
 // 运行一个协程
 func (w *Worker) Run() {
-	if w.close {
-		return
-	}
+	w.pool.waitGroup.Add(1)
+	defer w.pool.waitGroup.Done()
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -59,7 +50,6 @@ func (w *Worker) Run() {
 		}
 		//判断Worker是否过期
 		if w.Expire(w.pool.MaxLifeTime, w.pool.MaxIdleTime) {
-			w.Close()
 			w.pool.mayOpenWorkerThread()
 			return
 		}
@@ -75,7 +65,6 @@ func (w *Worker) Run() {
 				atomic.AddInt64(&w.pool.WaitTaskNum, -1)
 				continue
 			} else {
-				w.Close()
 				return
 			}
 		default:

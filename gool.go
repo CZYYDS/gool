@@ -35,7 +35,9 @@ type ThreadPool struct {
 	finishedTaskNum int64 //已完成的任务数
 	WaitTaskNum     int64 //等待执行的任务数
 
-	stopped bool //是否关闭
+	waitGroup sync.WaitGroup
+
+	stopped atomic.Bool //是否关闭
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -75,6 +77,7 @@ func New(maxCapacity, maxWorkers int64, options ...Option) *ThreadPool {
 		finishedTaskNum: 0,
 		WaitTaskNum:     0,
 		mutex:           sync.Mutex{},
+		waitGroup:       sync.WaitGroup{},
 		cleanerChan:     nil,
 	}
 	// Apply all options
@@ -108,6 +111,8 @@ func (pool *ThreadPool) initWorks() {
 
 // 创建新Worker线程
 func (pool *ThreadPool) WorkerOpener() {
+	pool.waitGroup.Add(1)
+	defer pool.waitGroup.Done()
 	for {
 		select {
 		case <-pool.ctx.Done():
@@ -121,7 +126,7 @@ func (pool *ThreadPool) WorkerOpener() {
 // 创建新Worker线程
 func (pool *ThreadPool) openNewWorker(ctx context.Context) {
 	//判断线程池是否关闭
-	if pool.stopped {
+	if pool.stopped.Load() {
 		return
 	}
 	select {
@@ -144,7 +149,7 @@ func (pool *ThreadPool) openNewWorker(ctx context.Context) {
 func (pool *ThreadPool) putWorkerThread(ctx context.Context, worker *Worker) bool {
 
 	//判断线程池是否关闭
-	if pool.stopped {
+	if pool.stopped.Load() {
 		return false
 	}
 	select {
@@ -180,7 +185,7 @@ func (pool *ThreadPool) putWorkerThread(ctx context.Context, worker *Worker) boo
 }
 
 func (pool *ThreadPool) mayOpenWorkerThread() bool {
-	if pool.stopped {
+	if pool.stopped.Load() {
 		return true
 	}
 	select {
@@ -200,18 +205,61 @@ func (pool *ThreadPool) mayOpenWorkerThread() bool {
 
 // 关闭线程池
 func (pool *ThreadPool) Stop() {
-	if pool.stopped {
+	if pool.stopped.Load() {
 		return
 	}
+	// go pool.Purge()
 	pool.cancel()
-	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
-	pool.stopped = true
+	pool.stopped.Store(true)
+}
+
+// 当线程池所有任务执行完成后关闭线程池
+// 1.等待所有提交的Task执行 2.释放全部开启的Worker 3.释放所有开启的协程
+func (pool *ThreadPool) gracefulStop() {
+	if pool.stopped.Load() {
+		return
+	}
+	timer := time.NewTicker(300 * time.Millisecond)
+	for {
+		select {
+		case <-timer.C:
+			if pool.getWaitTaskNum() == 0 {
+				pool.Stop()
+				go pool.Purge()
+				pool.waitGroup.Wait()
+				for range pool.RequestTasks {
+				}
+				return
+			}
+		}
+	}
+}
+
+// 关闭所有的Goroutine
+func (pool *ThreadPool) Purge() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	//关闭创建Worker的channel
+	close(pool.openerChan)
+	pool.waitGroup.Add(1)
+	defer pool.waitGroup.Done()
+	for {
+		select {
+		case <-ticker.C:
+			if pool.getOpenWorkers() > 0 {
+				//关闭开启的协程
+				pool.RequestTasks <- nil
+			} else {
+				close(pool.RequestTasks)
+				return
+			}
+		}
+	}
+
 }
 
 // 阻塞添加Task
 func (pool *ThreadPool) Submit(task func()) bool {
-	if pool.stopped {
+	if pool.stopped.Load() {
 		return false
 	}
 	if task == nil {
@@ -245,7 +293,7 @@ func (pool *ThreadPool) Submit(task func()) bool {
 
 }
 func (pool *ThreadPool) TrySubmit(task func(), timeout time.Duration) {
-	if pool.stopped {
+	if pool.stopped.Load() {
 		return
 	}
 	if task == nil {
@@ -268,12 +316,20 @@ func (pool *ThreadPool) TrySubmit(task func(), timeout time.Duration) {
 
 func (pool *ThreadPool) CleanWorkers() {
 	timer := time.NewTicker(time.Second * 60 * 3)
+
+	pool.waitGroup.Add(1)
+
+	defer func() {
+		pool.waitGroup.Done()
+		pool.mutex.Lock()
+		pool.cleanerChan = nil
+		pool.mutex.Unlock()
+	}()
 	for {
 		select {
 		case <-pool.ctx.Done():
 			return
 		case <-timer.C:
-			pool.cleanerChan = nil
 			return
 		default:
 		}
@@ -283,7 +339,6 @@ func (pool *ThreadPool) CleanWorkers() {
 				worker := pool.IdleWorkers[i]
 				//如果worker没有任务且超过最大空闲时间,则关闭该worker
 				if worker.Expire(pool.MaxLifeTime, pool.MaxIdleTime) {
-					worker.Close()
 					pool.IdleWorkers = append(pool.IdleWorkers[:i], pool.IdleWorkers[i+1:]...)
 					atomic.AddInt64(&pool.OpenWorkers, -1)
 					atomic.AddInt64(&pool.IdleWorkersNum, -1)
