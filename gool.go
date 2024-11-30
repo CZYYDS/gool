@@ -5,7 +5,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.uber.org/zap"
 )
+
+var logger = NewLogger()
 
 const (
 	defaultIdleTimeout = 10 * time.Second
@@ -18,7 +22,7 @@ type ThreadPool struct {
 	RequestTasks chan func()   //任务队列
 	openerChan   chan struct{} //Work线程创建信号
 	cleanerChan  *struct{}     //Work线程清除信号
-	IdleWorkers  []*Worker     //空闲Worker列表
+	IdleWorkers  *WorkerQueue  //空闲Worker列表
 
 	IdleWorkersNum int64 //空闲Worker数量
 
@@ -36,11 +40,9 @@ type ThreadPool struct {
 	WaitTaskNum     int64 //等待执行的任务数
 
 	waitGroup sync.WaitGroup
-
-	stopped atomic.Bool //是否关闭
-
-	ctx    context.Context
-	cancel context.CancelFunc
+	stopped   atomic.Bool //是否关闭
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func (pool *ThreadPool) getOpenWorkers() int64 {
@@ -68,6 +70,7 @@ func New(maxCapacity, maxWorkers int64, options ...Option) *ThreadPool {
 	pool := &ThreadPool{
 		RequestTasks:    make(chan func(), maxCapacity),
 		openerChan:      make(chan struct{}, maxWorkers),
+		IdleWorkers:     NewWorkerQueue(int(maxWorkers)),
 		MaxWorkers:      maxWorkers,
 		MaxIdleTime:     defaultIdleTimeout,
 		MaxLifeTime:     0, //当最大存活时间未设置时，默认不回收
@@ -88,7 +91,7 @@ func New(maxCapacity, maxWorkers int64, options ...Option) *ThreadPool {
 	pool.initWorks()
 
 	go pool.WorkerOpener()
-
+	logger.Info("create ThreadPool Success", zap.Int64("maxCapacity", maxCapacity), zap.Int64("maxWorkers", maxWorkers))
 	return pool
 }
 
@@ -102,7 +105,11 @@ func (pool *ThreadPool) initWorks() {
 	if pool.minWorkers > 0 {
 		for i := int64(0); i < pool.minWorkers; i++ {
 			worker := NewWorker(pool.ctx, pool)
-			pool.IdleWorkers = append(pool.IdleWorkers, worker)
+			//TODO 需要优化一下
+			err := pool.IdleWorkers.Enqueue(worker)
+			if err != nil {
+				logger.Warn("putWorkerThread err", zap.Error(err), zap.Int64("idleWorkersNum", pool.getIdleWorkersNum()))
+			}
 			atomic.AddInt64(&pool.IdleWorkersNum, 1)
 		}
 		atomic.AddInt64(&pool.OpenWorkers, pool.minWorkers)
@@ -141,6 +148,8 @@ func (pool *ThreadPool) openNewWorker(ctx context.Context) {
 	//TODO 创建一个新的Work
 	worker := NewWorker(ctx, pool)
 	if pool.putWorkerThread(ctx, worker) {
+		logger.Info("create a WorkerThread", zap.Int64("OpenWorkers", pool.getOpenWorkers()),
+			zap.Int64("WaitTaskNum", pool.getWaitTaskNum()), zap.Int64("IdleWorkersNum", pool.getIdleWorkersNum()), zap.Int64("MaxWorkers", pool.MaxWorkers))
 		atomic.AddInt64(&pool.OpenWorkers, 1)
 	}
 }
@@ -168,14 +177,18 @@ func (pool *ThreadPool) putWorkerThread(ctx context.Context, worker *Worker) boo
 			return true
 		}
 	} else if pool.MaxWorkers > 0 && pool.MaxWorkers > pool.getIdleWorkersNum() {
-
+		logger.Info("putIdeWorkerThread", zap.Int64("OpenWorkers", pool.getOpenWorkers()), zap.Int64("WaitTaskNum", pool.getWaitTaskNum()))
 		worker.returnAt = &nowFunc
 		pool.mutex.Lock()
-		pool.IdleWorkers = append(pool.IdleWorkers, worker)
+		err := pool.IdleWorkers.Enqueue(worker)
+		if err != nil {
+			logger.Warn("putWorkerThread err", zap.Error(err), zap.Int64("idleWorkersNum", pool.getIdleWorkersNum()))
+		}
 		atomic.AddInt64(&pool.IdleWorkersNum, 1)
 		//当空闲协程数量大于1时，开启一个Clean线程
 		if pool.getIdleWorkersNum() > 1 && pool.cleanerChan == nil {
 			pool.cleanerChan = &struct{}{}
+			logger.Info("start CleanWorkers", zap.Int64("idleWorkersNum", pool.getIdleWorkersNum()))
 			go pool.CleanWorkers()
 		}
 		pool.mutex.Unlock()
@@ -211,6 +224,8 @@ func (pool *ThreadPool) Stop() {
 	// go pool.Purge()
 	pool.cancel()
 	pool.stopped.Store(true)
+	logger.Info("stop ThreadPool", zap.Int64("OpenWorkers", pool.getOpenWorkers()), zap.Int64("IdleWorkersNum", pool.getIdleWorkersNum()),
+		zap.Int64("WaitTaskNum", pool.getWaitTaskNum()), zap.Int64("finishedTaskNum", pool.finishedTaskNum))
 }
 
 // 当线程池所有任务执行完成后关闭线程池
@@ -229,6 +244,8 @@ func (pool *ThreadPool) gracefulStop() {
 				pool.waitGroup.Wait()
 				for range pool.RequestTasks {
 				}
+				logger.Info("stop ThreadPool", zap.Int64("OpenWorkers", pool.getOpenWorkers()), zap.Int64("IdleWorkersNum", pool.getIdleWorkersNum()),
+					zap.Int64("WaitTaskNum", pool.getWaitTaskNum()), zap.Int64("finishedTaskNum", pool.finishedTaskNum))
 				return
 			}
 		}
@@ -250,6 +267,7 @@ func (pool *ThreadPool) Purge() {
 				pool.RequestTasks <- nil
 			} else {
 				close(pool.RequestTasks)
+				logger.Info("complete all tasks", zap.Int64("OpenWorkers", pool.getOpenWorkers()), zap.Int64("WaitTaskNum", pool.getWaitTaskNum()))
 				return
 			}
 		}
@@ -275,8 +293,10 @@ func (pool *ThreadPool) Submit(task func()) bool {
 	if pool.getIdleWorkersNum() > 0 {
 		//TODO 可以开启一个Clean线程,清理空闲的Work
 		pool.mutex.Lock()
-		worker := pool.IdleWorkers[0]
-		pool.IdleWorkers = pool.IdleWorkers[1:]
+		worker, err := pool.IdleWorkers.Dequeue()
+		if err != nil {
+
+		}
 		atomic.AddInt64(&pool.IdleWorkersNum, -1)
 		pool.mutex.Unlock()
 		go worker.Run()
@@ -289,6 +309,7 @@ func (pool *ThreadPool) Submit(task func()) bool {
 	//阻塞添加任务到任务队列
 	pool.RequestTasks <- task
 	atomic.AddInt64(&pool.WaitTaskNum, 1)
+	logger.Info("submit task success", zap.Int64("OpenWorkers", pool.getOpenWorkers()), zap.Int64("WaitTaskNum", pool.getWaitTaskNum()))
 	return true
 
 }
@@ -336,12 +357,17 @@ func (pool *ThreadPool) CleanWorkers() {
 		pool.mutex.Lock()
 		if pool.getIdleWorkersNum() > 0 {
 			for i := 0; i < int(pool.getIdleWorkersNum()); i++ {
-				worker := pool.IdleWorkers[i]
+				worker := pool.IdleWorkers.GetFirst()
+				if worker == nil {
+					//打印日志
+					continue
+				}
 				//如果worker没有任务且超过最大空闲时间,则关闭该worker
 				if worker.Expire(pool.MaxLifeTime, pool.MaxIdleTime) {
-					pool.IdleWorkers = append(pool.IdleWorkers[:i], pool.IdleWorkers[i+1:]...)
+					pool.IdleWorkers.RemoveFirst()
 					atomic.AddInt64(&pool.OpenWorkers, -1)
 					atomic.AddInt64(&pool.IdleWorkersNum, -1)
+					logger.Info("clean a workerThread", zap.Int64("OpenWorkers", pool.getOpenWorkers()), zap.Int64("CreateAt", worker.createdAt.Unix()), zap.Int64("IdleWorkersNum", pool.getIdleWorkersNum()))
 					pool.mayOpenWorkerThread()
 				}
 			}

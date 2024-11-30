@@ -72,7 +72,7 @@ func (w *Worker) Run() {
 		//走到这说明worker是空闲的
 		w.pool.mutex.Lock()
 		w.returnAt = &nowFunc
-		w.pool.IdleWorkers = append(w.pool.IdleWorkers, w)
+		w.pool.IdleWorkers.Enqueue(w)
 		atomic.AddInt64(&w.pool.IdleWorkersNum, 1)
 		w.pool.mutex.Unlock()
 		return
